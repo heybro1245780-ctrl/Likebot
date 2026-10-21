@@ -7,6 +7,7 @@ import discord
 import subprocess
 from datetime import datetime, timedelta, timezone
 from discord.ext import commands, tasks
+from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,7 +49,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content    = True   # required for $ prefix commands
+intents.guild_messages     = True   # required to read messages
+intents.guilds             = True
 # Set owner_id at creation so commands.is_owner() works before on_ready fires
 bot = commands.Bot(
     command_prefix=BOT_PREFIX,
@@ -56,6 +59,7 @@ bot = commands.Bot(
     help_command=None,
     owner_id=OWNER_ID,
 )
+tree = bot.tree  # alias for slash commands
 
 
 # ── Subscription DB helpers ───────────────────────────────────────────────────
@@ -169,22 +173,28 @@ async def api_post(path: str, payload: dict, timeout: int = 15):
 async def on_ready():
     try:
         app_info = await bot.application_info()
-        # Always prefer the API result, but OWNER_ID is already set at construction
         if app_info.owner:
             bot.owner_id = app_info.owner.id
     except Exception:
-        pass  # owner_id already set to OWNER_ID at bot creation
+        pass  # owner_id already hardcoded at bot construction
 
-    print(f"[OK] Bot: {bot.user}  Owner ID: {bot.owner_id}  Prefix: {BOT_PREFIX}")
+    print(f"[OK] Bot: {bot.user}  Owner ID: {bot.owner_id}  Prefix: {BOT_PREFIX}", flush=True)
 
     # Register global channel check (only respond in ALLOWED_CHANNEL)
     bot.add_check(channel_check)
 
+    # ── Sync slash commands ───────────────────────────────────────────────────
+    try:
+        synced = await bot.tree.sync()
+        print(f"[OK] Synced {len(synced)} slash command(s) globally.", flush=True)
+    except Exception as e:
+        print(f"[WARN] Slash command sync failed: {e}", flush=True)
+
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{BOT_PREFIX}help | FF Like Bot"
+        name=f"{BOT_PREFIX}help | /help"
     ))
-    print(f"[OK] Commands restricted to channel ID: {ALLOWED_CHANNEL}")
+    print(f"[OK] Commands restricted to channel ID: {ALLOWED_CHANNEL}", flush=True)
 
     # Start scheduled tasks
     if not daily_reset_task.is_running():
@@ -847,6 +857,288 @@ async def help_command(ctx):
 
     embed.set_footer(text=f"Auto-like runs daily at 4:05 AM IST | Prefix: {p}")
     await ctx.send(embed=embed)
+
+
+
+# ── Slash Commands (/command) ─────────────────────────────────────────────────
+# Helper: check owner + channel for slash interactions
+
+def _slash_owner(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == OWNER_ID
+
+def _slash_channel(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return True   # DMs always OK
+    return interaction.channel_id == ALLOWED_CHANNEL
+
+async def _slash_guard(interaction: discord.Interaction) -> bool:
+    """Returns True if interaction is allowed, else replies with error and returns False."""
+    if not _slash_channel(interaction):
+        await interaction.response.send_message(
+            embed=err_embed("Wrong Channel", f"Use commands in <#{ALLOWED_CHANNEL}>"),
+            ephemeral=True
+        )
+        return False
+    if not _slash_owner(interaction):
+        await interaction.response.send_message(
+            embed=err_embed("Owner Only", "Only the bot owner can use this."),
+            ephemeral=True
+        )
+        return False
+    return True
+
+
+@tree.command(name="like", description="Send likes to a Free Fire player")
+@app_commands.describe(uid="Player UID (numbers only)", region="Region code e.g. IND, BD, BR")
+async def slash_like(interaction: discord.Interaction, uid: str, region: str):
+    if not await _slash_guard(interaction): return
+    region = region.upper()
+    if not uid.isdigit():
+        return await interaction.response.send_message(embed=err_embed("Invalid UID", "Numbers only."), ephemeral=True)
+    if region not in VALID_REGIONS:
+        return await interaction.response.send_message(embed=err_embed("Invalid Region", "Valid: `" + "` `".join(sorted(VALID_REGIONS)) + "`"), ephemeral=True)
+    await interaction.response.send_message(embed=discord.Embed(title="⏳ Sending Likes...", description=f"UID: `{uid}` | Region: `{region}`", color=discord.Color.blurple()))
+    try:
+        status, data = await api_get("/like", {"uid": uid, "region": region, "key": API_KEY})
+        if status == 401:
+            embed = err_embed("API Key Error", "Invalid API key.")
+        elif status == 200:
+            s = data.get("status", 2); likes_given = data.get("LikesGivenByAPI", 0)
+            nickname = data.get("PlayerNickname", "?"); level = data.get("Level", "?")
+            p_region = data.get("Region", region); after = data.get("LikesafterCommand", 0)
+            before = data.get("LikesbeforeCommand", 0); remaining = data.get("remaining", 0)
+            daily_limit = data.get("daily_limit", 300); used = data.get("used", 0)
+            if s == 1:
+                BOT_STATS["total_likes_sent"] += likes_given
+                title, color = f"❤️ Likes Sent — {nickname}!", discord.Color.green()
+            else:
+                title, color = f"⚠️ Maxed — {nickname}", discord.Color.orange()
+            embed = discord.Embed(title=title, color=color)
+            embed.add_field(name="👤 Player", value=f"**{nickname}**", inline=True)
+            embed.add_field(name="🏅 Level", value=f"`{level}`", inline=True)
+            embed.add_field(name="🌍 Region", value=f"`{REGION_FLAGS.get(str(p_region), str(p_region))} {p_region}`", inline=True)
+            embed.add_field(name="❤️ Given", value=f"` +{likes_given} `", inline=True)
+            embed.add_field(name="📊 Total", value=f"`{before}` → `{after}`", inline=True)
+            embed.add_field(name="📅 Quota", value=f"{progress_bar(used, daily_limit)}  `{remaining}` left", inline=False)
+        else:
+            embed = err_embed("API Error", f"HTTP {status}")
+    except asyncio.TimeoutError:
+        embed = err_embed("Timeout", "API took too long.")
+    except Exception as e:
+        embed = err_embed("Error", str(e)[:400])
+    await interaction.edit_original_response(embed=embed)
+
+
+@tree.command(name="info", description="Get Free Fire player info")
+@app_commands.describe(uid="Player UID", region="Region code e.g. IND, BD")
+async def slash_info(interaction: discord.Interaction, uid: str, region: str):
+    if not await _slash_guard(interaction): return
+    region = region.upper()
+    if not uid.isdigit():
+        return await interaction.response.send_message(embed=err_embed("Invalid UID", "Numbers only."), ephemeral=True)
+    await interaction.response.send_message(embed=info_embed("Fetching...", f"UID `{uid}` in `{region}`"))
+    try:
+        status, data = await api_get("/like", {"uid": uid, "region": region, "key": API_KEY})
+        if status == 200:
+            nickname = data.get("PlayerNickname", "?"); level = data.get("Level", "?")
+            p_region = data.get("Region", region); likes = data.get("LikesafterCommand", 0)
+            embed = discord.Embed(title=f"🎮 {nickname}", color=discord.Color.blurple())
+            embed.add_field(name="🆔 UID", value=f"`{uid}`", inline=True)
+            embed.add_field(name="🏅 Level", value=f"`{level}`", inline=True)
+            embed.add_field(name="🌍 Region", value=f"`{REGION_FLAGS.get(str(p_region), str(p_region))} {p_region}`", inline=True)
+            embed.add_field(name="❤️ Likes", value=f"`{likes}`", inline=True)
+        else:
+            embed = err_embed("Not Found", f"UID `{uid}` in `{region}` not found.")
+    except Exception as e:
+        embed = err_embed("Error", str(e)[:300])
+    await interaction.edit_original_response(embed=embed)
+
+
+@tree.command(name="remain", description="Check daily like quota")
+async def slash_remain(interaction: discord.Interaction):
+    if not await _slash_guard(interaction): return
+    await interaction.response.defer()
+    try:
+        status, data = await api_get("/remain", timeout=10)
+        dl = data.get("daily_limit", 300); used = data.get("used", 0)
+        rem = data.get("remaining", 0); rst = data.get("reset_info", "?")
+        embed = discord.Embed(title="📊 Daily Quota", color=discord.Color.blurple())
+        embed.add_field(name="🔢 Limit", value=f"`{dl}`", inline=True)
+        embed.add_field(name="✅ Used", value=f"`{used}`", inline=True)
+        embed.add_field(name="🔋 Remaining", value=f"`{rem}`", inline=True)
+        embed.add_field(name="🔄 Resets At", value=f"`{rst}`", inline=True)
+        embed.add_field(name="📈 Progress", value=progress_bar(used, dl), inline=False)
+    except Exception as e:
+        embed = err_embed("Error", str(e))
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="ping", description="Check bot and API status")
+async def slash_ping(interaction: discord.Interaction):
+    if not await _slash_guard(interaction): return
+    await interaction.response.defer()
+    ws_ms = round(bot.latency * 1000)
+    t0 = time.monotonic()
+    try:
+        st, _ = await api_get("/remain", timeout=5); api_ok = st == 200
+    except Exception:
+        api_ok = False
+    api_ms = round((time.monotonic() - t0) * 1000)
+    color = discord.Color.green() if api_ok else discord.Color.red()
+    embed = discord.Embed(title="🏓 Status", color=color)
+    embed.add_field(name="💬 Bot", value=f"`{ws_ms}ms`", inline=True)
+    embed.add_field(name="🌐 API", value=f"`{api_ms}ms`", inline=True)
+    embed.add_field(name="🔌 Online", value="`Yes`" if api_ok else "`No`", inline=True)
+    embed.add_field(name="⏱️ Uptime", value=f"`{uptime_str()}`", inline=True)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="stats", description="Show bot statistics")
+async def slash_stats(interaction: discord.Interaction):
+    if not await _slash_guard(interaction): return
+    await interaction.response.defer()
+    subs = load_subs(); active = sum(1 for s in subs.values() if not sub_expired(s))
+    embed = discord.Embed(title="📈 Bot Statistics", color=discord.Color.gold())
+    embed.add_field(name="❤️ Likes Sent", value=f"`{BOT_STATS['total_likes_sent']}`", inline=True)
+    embed.add_field(name="⌨️ Commands", value=f"`{BOT_STATS['total_commands']}`", inline=True)
+    embed.add_field(name="❌ Failures", value=f"`{BOT_STATS['failed_requests']}`", inline=True)
+    embed.add_field(name="🤖 AutoLike Runs", value=f"`{BOT_STATS['autolike_runs']}`", inline=True)
+    embed.add_field(name="👥 Active Subs", value=f"`{active}`", inline=True)
+    embed.add_field(name="⏱️ Uptime", value=f"`{uptime_str()}`", inline=True)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="plan", description="Manage auto-like subscription plans")
+@app_commands.describe(
+    action="Action: add / remove / extend / check / list / run",
+    user="Target Discord user",
+    uid="Free Fire UID",
+    region="Region (IND, BD, BR...)",
+    plan_type="Plan: daily / weekly / monthly / lifetime",
+    days="Days to extend (for extend action)"
+)
+async def slash_plan(
+    interaction: discord.Interaction,
+    action: str,
+    user: discord.Member = None,
+    uid: str = None,
+    region: str = None,
+    plan_type: str = None,
+    days: int = None
+):
+    if not await _slash_guard(interaction): return
+    await interaction.response.defer()
+    action = action.lower()
+    p = BOT_PREFIX
+
+    if action == "add":
+        if not all([user, uid, region, plan_type]):
+            return await interaction.followup.send(embed=err_embed("Usage", f"`/plan action:add user:@user uid:123 region:IND plan_type:monthly`\nPlans: `daily` `weekly` `monthly` `lifetime`"))
+        region = region.upper(); plan_type = plan_type.lower()
+        if not uid.isdigit():
+            return await interaction.followup.send(embed=err_embed("Invalid UID", "Numbers only."))
+        if region not in VALID_REGIONS:
+            return await interaction.followup.send(embed=err_embed("Invalid Region", "Valid: `" + "` `".join(sorted(VALID_REGIONS)) + "`"))
+        if plan_type not in PLAN_DAYS:
+            return await interaction.followup.send(embed=err_embed("Invalid Plan", "Plans: `daily` `weekly` `monthly` `lifetime`"))
+        subs = load_subs(); discord_id = str(user.id)
+        plan_days = PLAN_DAYS[plan_type]; expires_at = None if plan_days is None else time.time() + plan_days * 86400
+        subs[discord_id] = {"uid": uid, "region": region, "plan": plan_type, "expires_at": expires_at,
+                             "added_by": str(interaction.user.id), "added_at": time.time(), "discord_tag": str(user)}
+        save_subs(subs)
+        embed = ok_embed(f"Plan Added — {user.display_name}", f"**User:** {user.mention}\n**UID:** `{uid}`\n**Region:** `{region}`\n**Plan:** `{plan_type.capitalize()}`\n**Expires:** {plan_expires_str(subs[discord_id])}")
+        await interaction.followup.send(embed=embed)
+        try:
+            await user.send(embed=discord.Embed(title="🎮 Auto-Like Plan Activated!", description=f"Your **{plan_type.capitalize()}** auto-like plan is now active!\n\n**UID:** `{uid}`\n**Region:** `{region}`\n**Likes:** Sent daily at **4:05 AM IST**\n**Expires:** {plan_expires_str(subs[discord_id])}", color=discord.Color.green()))
+        except Exception: pass
+        await log(embed)
+
+    elif action == "remove":
+        if not user:
+            return await interaction.followup.send(embed=err_embed("Usage", "`/plan action:remove user:@user`"))
+        subs = load_subs(); discord_id = str(user.id)
+        if discord_id not in subs:
+            return await interaction.followup.send(embed=err_embed("Not Found", f"{user.mention} has no active plan."))
+        sub = subs.pop(discord_id); save_subs(subs)
+        await interaction.followup.send(embed=ok_embed("Plan Removed", f"Removed `{sub['plan']}` plan for {user.mention}"))
+
+    elif action == "extend":
+        if not user or days is None:
+            return await interaction.followup.send(embed=err_embed("Usage", "`/plan action:extend user:@user days:7`"))
+        subs = load_subs(); discord_id = str(user.id)
+        if discord_id not in subs:
+            return await interaction.followup.send(embed=err_embed("Not Found", f"No plan for {user.mention}. Add one first."))
+        sub = subs[discord_id]
+        if sub["expires_at"] is None:
+            return await interaction.followup.send(embed=err_embed("Lifetime Plan", "Already lifetime."))
+        sub["expires_at"] = max(sub["expires_at"], time.time()) + days * 86400; save_subs(subs)
+        await interaction.followup.send(embed=ok_embed("Plan Extended", f"Extended for {user.mention} by **{days} days**\nNew expiry: {plan_expires_str(sub)}"))
+
+    elif action == "check":
+        target = user or interaction.user
+        subs = load_subs(); discord_id = str(target.id)
+        if discord_id not in subs:
+            return await interaction.followup.send(embed=info_embed(f"{target.display_name} — No Plan", "No active subscription found."))
+        sub = subs[discord_id]; expired = sub_expired(sub)
+        embed = discord.Embed(title=f"{'⚠️ Expired' if expired else '✅ Active'} — {target.display_name}", color=discord.Color.red() if expired else discord.Color.green())
+        embed.add_field(name="🆔 UID", value=f"`{sub['uid']}`", inline=True)
+        embed.add_field(name="🌍 Region", value=f"`{sub['region']}`", inline=True)
+        embed.add_field(name="📋 Plan", value=f"`{sub['plan'].capitalize()}`", inline=True)
+        embed.add_field(name="⏳ Expires", value=plan_expires_str(sub), inline=False)
+        await interaction.followup.send(embed=embed)
+
+    elif action == "list":
+        subs = load_subs()
+        if not subs:
+            return await interaction.followup.send(embed=info_embed("No Subscribers", "No plans are active."))
+        lines = []
+        for did, sub in subs.items():
+            expired = "⚠️" if sub_expired(sub) else "✅"
+            lines.append(f"{expired} **{sub.get('discord_tag', did)}** | `{sub['uid']}` `{sub['region']}` `{sub['plan']}` | {plan_expires_str(sub)}")
+        pages = [lines[i:i+10] for i in range(0, len(lines), 10)]
+        for i, page in enumerate(pages):
+            await interaction.followup.send(embed=discord.Embed(title=f"👥 Subscribers ({len(subs)} total) — Page {i+1}/{len(pages)}", description="\n".join(page), color=discord.Color.blurple()))
+
+    elif action == "run":
+        await interaction.followup.send(embed=info_embed("Auto-Like Triggered", "Running now..."))
+        await daily_autolike_task()
+    else:
+        await interaction.followup.send(embed=err_embed("Unknown Action", "Use: `add` `remove` `extend` `check` `list` `run`"))
+
+
+@tree.command(name="help", description="Show all available commands")
+async def slash_help(interaction: discord.Interaction):
+    if not await _slash_guard(interaction): return
+    p = BOT_PREFIX
+    embed = discord.Embed(title="🎮 FF Like Bot — Owner Commands", description=f"Use `{p}cmd` or `/cmd` — both work!", color=discord.Color.gold())
+    embed.add_field(name="⚡ Like Commands", value=(
+        f"`/like` or `{p}like <uid> <region>` — Send likes\n"
+        f"`/info` or `{p}info <uid> <region>` — Player info\n"
+        f"`/remain` or `{p}remain` — Daily quota\n"
+        f"`/ping` or `{p}ping` — Bot status\n"
+        f"`/stats` or `{p}stats` — Statistics"
+    ), inline=False)
+    embed.add_field(name="📋 Subscription Plans", value=(
+        f"`/plan action:add` — Add auto-like plan\n"
+        f"`/plan action:remove` — Remove plan\n"
+        f"`/plan action:extend` — Extend plan\n"
+        f"`/plan action:check` — Check plan status\n"
+        f"`/plan action:list` — List all subscribers\n"
+        f"`/plan action:run` — Trigger auto-like now\n"
+        f"Plans: `daily(1d)` `weekly(7d)` `monthly(30d)` `lifetime`"
+    ), inline=False)
+    embed.add_field(name="🔧 Token Management (prefix only)", value=(
+        f"`{p}adduid <uid> <pass> [region]` — Add UID\n"
+        f"`{p}removeuid <uid> [region]` — Remove UID\n"
+        f"`{p}listuid [region]` — List UIDs\n"
+        f"`{p}refresh` — Refresh all tokens"
+    ), inline=False)
+    embed.add_field(name="⚙️ Admin", value=(
+        f"`{p}setlimit <n>` — Update daily limit\n"
+        f"`{p}resetcount` — Reset daily count"
+    ), inline=False)
+    embed.set_footer(text=f"Auto-like runs daily at 4:05 AM IST | Prefix: {p}")
+    await interaction.response.send_message(embed=embed)
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
