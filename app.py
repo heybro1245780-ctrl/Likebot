@@ -1,7 +1,14 @@
 from flask import Flask, request, jsonify, Response
 import requests
 import json
+import random
+import os
 from collections import OrderedDict
+
+# ── Protobuf imports ──────────────────────────────────────────────────────────
+from like_pb2 import like as LikeMessage
+from uid_generator_pb2 import uid_generator as UIDGen
+from visit_count_pb2 import Info as VisitInfo
 
 app = Flask(__name__)
 
@@ -11,11 +18,139 @@ VALID_API_KEYS = {"like"}
 daily_limit = 300
 used_count  = 0
 
-# ── External Like API config ──────────────────────────────────────────────────
-EXT_API_BASE = "https://like.mujahid.xyz/like"
-EXT_API_KEY  = "ABHINANDAN"
-
 VALID_REGIONS = {"IND", "BD"}
+
+# ── Region → Garena like endpoint ─────────────────────────────────────────────
+REGION_LIKE_URL = {
+    "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
+    "BD":  "https://clientbd.freefiremobile.com/GetPlayerPersonalShow",
+}
+
+# Token files per region
+TOKEN_FILES = {
+    "IND": "token_ind.json",
+    "BD":  "token_bd.json",
+}
+
+
+# ── Token loader ──────────────────────────────────────────────────────────────
+def load_tokens(region: str) -> list:
+    path = TOKEN_FILES.get(region, "")
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tokens = []
+        for entry in data:
+            if isinstance(entry, dict):
+                t = entry.get("token") or entry.get("jwt_token") or entry.get("access_token")
+            elif isinstance(entry, str):
+                t = entry
+            else:
+                continue
+            if t:
+                tokens.append(t)
+        return tokens
+    except Exception:
+        return []
+
+
+def pick_token(region: str):
+    tokens = load_tokens(region)
+    return random.choice(tokens) if tokens else None
+
+
+# ── Build protobuf bodies ─────────────────────────────────────────────────────
+def build_like_body(uid: int, region: str) -> bytes:
+    msg = LikeMessage()
+    msg.uid    = uid
+    msg.region = region
+    return msg.SerializeToString()
+
+
+def build_uid_body(uid: int) -> bytes:
+    msg = UIDGen()
+    msg.saturn_ = uid
+    msg.garena  = 0
+    return msg.SerializeToString()
+
+
+# ── Common Garena headers ─────────────────────────────────────────────────────
+def garena_headers(token: str) -> dict:
+    return {
+        "Authorization":   f"Bearer {token}",
+        "Content-Type":    "application/x-www-form-urlencoded",
+        "User-Agent":      "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        "Connection":      "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "X-Unity-Version": "2018.4.11f1",
+        "ReleaseVersion":  "OB55",
+    }
+
+
+# ── Fetch current likes for a player ─────────────────────────────────────────
+def get_player_info(uid: int, region: str, token: str = None):
+    """Returns (nickname, level, p_region, likes) or raises on failure."""
+    if token is None:
+        token = pick_token(region)
+    if not token:
+        raise RuntimeError(f"No tokens available for region {region}")
+    url  = REGION_LIKE_URL.get(region)
+    body = build_uid_body(uid)
+    resp = requests.post(url, data=body, headers=garena_headers(token), timeout=20)
+    resp.raise_for_status()
+    info = VisitInfo()
+    info.ParseFromString(resp.content)
+    acc = info.AccountInfo
+    return acc.PlayerNickname or str(uid), acc.Levels, acc.PlayerRegion or region, acc.Likes
+
+
+# ── Send likes to a UID ───────────────────────────────────────────────────────
+def send_likes(uid: int, region: str) -> dict:
+    token = pick_token(region)
+    if not token:
+        return {"error": f"No tokens available for region {region}", "status": 0}
+
+    url  = REGION_LIKE_URL.get(region)
+
+    # Fetch info BEFORE sending likes
+    try:
+        nickname, level, p_region, before_likes = get_player_info(uid, region, token)
+    except Exception as e:
+        return {"error": f"Player info fetch failed: {str(e)}", "status": 0}
+
+    # Send like
+    like_body = build_like_body(uid, region)
+    try:
+        resp = requests.post(url, data=like_body, headers=garena_headers(token), timeout=30)
+    except requests.exceptions.Timeout:
+        return {"error": "Garena API timed out", "status": 0}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Network error: {str(e)}", "status": 0}
+
+    if resp.status_code not in (200, 400):
+        return {"error": f"Garena returned HTTP {resp.status_code}", "status": 0}
+
+    # Fetch info AFTER to calculate delta
+    try:
+        _, _, _, after_likes = get_player_info(uid, region, token)
+    except Exception:
+        after_likes = before_likes   # fallback — assume maxed
+
+    given  = max(after_likes - before_likes, 0)
+    status = 1 if given > 0 else 2   # 1=sent, 2=maxed/already full
+
+    return {
+        "LikesGivenByAPI":   given,
+        "LikesafterCommand": after_likes,
+        "LikesbeforeCommand":before_likes,
+        "PlayerNickname":    nickname,
+        "Level":             level,
+        "Region":            p_region,
+        "UID":               uid,
+        "status":            status,
+    }
 
 
 # ── Home ──────────────────────────────────────────────────────────────────────
@@ -37,7 +172,6 @@ def home():
 def handle_requests():
     global used_count
 
-    # API key check
     api_key = request.args.get("key")
     if api_key not in VALID_API_KEYS:
         return Response(
@@ -46,67 +180,32 @@ def handle_requests():
             status=401, mimetype='application/json'
         )
 
-    uid    = request.args.get("uid", "").strip()
-    region = request.args.get("region", "").upper().strip()
+    uid_str = request.args.get("uid", "").strip()
+    region  = request.args.get("region", "").upper().strip()
 
-    if not uid or not uid.isdigit():
+    if not uid_str or not uid_str.isdigit():
         return jsonify({"error": "UID must be a number"}), 400
     if region not in VALID_REGIONS:
         return jsonify({"error": f"Region '{region}' not supported. Use IND or BD."}), 400
 
-    # ── Call external API ────────────────────────────────────────────────────
-    try:
-        resp = requests.get(
-            EXT_API_BASE,
-            params={"uid": uid, "region": region, "key": EXT_API_KEY},
-            timeout=60
-        )
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "External API timed out", "status": 0}), 504
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"External API unreachable: {str(e)}", "status": 0}), 502
+    data = send_likes(int(uid_str), region)
 
-    if resp.status_code != 200:
-        return jsonify({
-            "error":  f"External API returned HTTP {resp.status_code}",
-            "detail": resp.text[:300],
-            "status": 0
-        }), resp.status_code
+    if data.get("status") == 0:
+        return jsonify({"error": data.get("error", "Like failed"), "status": 0}), 502
 
-    try:
-        data = resp.json()
-    except Exception:
-        return jsonify({"error": "External API returned invalid JSON", "status": 0}), 502
-
-    # ── Normalise field names (handle both snake_case and PascalCase APIs) ───
-    def _get(*keys, default=0):
-        for k in keys:
-            if k in data:
-                return data[k]
-        return default
-
-    likes_given  = _get("LikesGivenByAPI",    "likes_given",   default=0)
-    after_likes  = _get("LikesafterCommand",   "likes_after",   default=0)
-    before_likes = _get("LikesbeforeCommand",  "likes_before",  default=0)
-    nickname     = _get("PlayerNickname",      "nickname",      default="?")
-    level        = _get("Level",               "level",         default="?")
-    p_region     = _get("Region",              "region",        default=region)
-    p_uid        = _get("UID",                 "uid",           default=uid)
-    status       = _get("status",                               default=2)
-
-    # ── Quota tracking ───────────────────────────────────────────────────────
+    status    = data.get("status", 2)
     if status == 1:
         used_count += 1
     remaining = max(daily_limit - used_count, 0)
 
     result = OrderedDict([
-        ("LikesGivenByAPI",   likes_given),
-        ("LikesafterCommand", after_likes),
-        ("LikesbeforeCommand",before_likes),
-        ("PlayerNickname",    nickname),
-        ("Level",             level),
-        ("Region",            p_region),
-        ("UID",               p_uid),
+        ("LikesGivenByAPI",   data.get("LikesGivenByAPI", 0)),
+        ("LikesafterCommand", data.get("LikesafterCommand", 0)),
+        ("LikesbeforeCommand",data.get("LikesbeforeCommand", 0)),
+        ("PlayerNickname",    data.get("PlayerNickname", "?")),
+        ("Level",             data.get("Level", "?")),
+        ("Region",            data.get("Region", region)),
+        ("UID",               data.get("UID", uid_str)),
         ("status",            status),
         ("daily_limit",       daily_limit),
         ("used",              used_count),
@@ -160,6 +259,5 @@ def reset_count():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    import os
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
