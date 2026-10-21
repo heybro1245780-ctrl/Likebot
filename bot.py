@@ -12,21 +12,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────-
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 API_KEY          = os.getenv("API_KEY", "like")
-API_BASE_URL     = os.getenv("API_BASE_URL", "http://127.0.0.1:5000")
+_PORT            = os.getenv("PORT", "5000")                                  # matches gunicorn bind port
+API_BASE_URL     = os.getenv("API_BASE_URL", f"http://127.0.0.1:{_PORT}")    # auto-matches Flask port
 BOT_PREFIX       = os.getenv("BOT_PREFIX", "$")
 LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID",  "1562386401314607134"))  # log channel
 ALLOWED_CHANNEL  = int(os.getenv("ALLOWED_CHANNEL", "1562382385075585034"))  # commands-only channel
-OWNER_ID         = int(os.getenv("OWNER_ID",         "1390358560478728264"))  # your Discord user ID
+OWNER_ID         = 1390358560478728264                                        # hardcoded — cannot be overridden
 SUBS_FILE        = "subscriptions.json"
 
-VALID_REGIONS = {"IND", "BD", "BR", "US", "SAC", "NA", "SG", "TH", "ID", "TW", "VN", "PK"}
+VALID_REGIONS = {"IND", "BD"}
 REGION_FLAGS  = {
-    "IND": "IN", "BD": "BD", "BR": "BR", "US": "US",
-    "SG": "SG", "TH": "TH", "ID": "ID", "TW": "TW",
-    "VN": "VN", "PK": "PK", "SAC": "SA", "NA": "NA",
+    "IND": "🇮🇳",
+    "BD":  "🇧🇩",
 }
 
 PLAN_DAYS = {
@@ -95,13 +95,30 @@ def plan_expires_str(sub: dict) -> str:
     return f"{dt.strftime('%d %b %Y')} ({days}d {hrs}h left)"
 
 
-# ── General helpers ───────────────────────────────────────────────────────────
-def progress_bar(used, total, length=10):
+# ── UI constants ──────────────────────────────────────────────────────────────
+COL_OK   = 0x2ECC71   # green
+COL_ERR  = 0xE74C3C   # red
+COL_WARN = 0xF39C12   # orange
+COL_INFO = 0x5865F2   # blurple
+COL_GOLD = 0xF1C40F   # gold
+COL_DARK = 0x2F3136   # dark
+
+
+def _ft(e: discord.Embed) -> discord.Embed:
+    """Attach timestamp + footer to every embed."""
+    e.timestamp = datetime.now(IST)
+    e.set_footer(text="FF Like Bot  •  IST")
+    return e
+
+
+def progress_bar(used, total, length=12):
     if total == 0:
-        return "[----------] 0%"
+        return "`░░░░░░░░░░░░`  0%"
+    pct    = int(100 * used / total)
     filled = int(length * used / total)
-    bar = "#" * filled + "-" * (length - filled)
-    return f"[{bar}] {int(100 * used / total)}%"
+    bar    = "█" * filled + "░" * (length - filled)
+    dot    = "🟢" if pct < 70 else ("🟡" if pct < 90 else "🔴")
+    return f"{dot} `{bar}` {pct}%"
 
 
 def uptime_str():
@@ -112,15 +129,23 @@ def uptime_str():
 
 
 def err_embed(title, desc=""):
-    return discord.Embed(title=f"❌ {title}", description=desc, color=discord.Color.red())
+    return _ft(discord.Embed(title=f"✗  {title}", description=desc or None, color=COL_ERR))
 
 
 def ok_embed(title, desc=""):
-    return discord.Embed(title=f"✅ {title}", description=desc, color=discord.Color.green())
+    return _ft(discord.Embed(title=f"✓  {title}", description=desc or None, color=COL_OK))
 
 
 def info_embed(title, desc=""):
-    return discord.Embed(title=f"ℹ️ {title}", description=desc, color=discord.Color.blurple())
+    return _ft(discord.Embed(title=f"◈  {title}", description=desc or None, color=COL_INFO))
+
+
+def warn_embed(title, desc=""):
+    return _ft(discord.Embed(title=f"⚠  {title}", description=desc or None, color=COL_WARN))
+
+
+def loading_embed(desc="Please wait…"):
+    return _ft(discord.Embed(title="⟳  Processing…", description=desc, color=COL_DARK))
 
 
 # ── Global channel restriction ────────────────────────────────────────────────
@@ -219,20 +244,24 @@ async def on_command_error(ctx, error):
         ), delete_after=6)
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=err_embed("Missing Arguments", f"Use `{BOT_PREFIX}help` for usage."))
-    elif isinstance(error, commands.NotOwner):
-        await ctx.send(embed=err_embed("Owner Only", "This command is restricted to the bot owner."))
-    elif isinstance(error, commands.CheckFailure):
-        await ctx.send(embed=err_embed("No Access", "You do not have access to use this bot.\nContact the owner."))
+    elif isinstance(error, (commands.NotOwner, commands.CheckFailure)):
+        # Silent — wrong user or wrong channel, do nothing
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
         await ctx.send(embed=err_embed("Error", str(error)[:500]))
 
 
-# ── Owner-only check ──────────────────────────────────────────────────────────
+# ── Owner-only check (hardcoded ID — cannot be bypassed) ─────────────────────
 def owner_only():
-    """Restrict command to owner only."""
-    return commands.is_owner()
+    """Only user with ID == OWNER_ID can run this command."""
+    async def predicate(ctx: commands.Context) -> bool:
+        return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
 
 
 # ── Scheduled Tasks ───────────────────────────────────────────────────────────
@@ -328,7 +357,7 @@ async def daily_autolike_task():
 
 # ── !like ─────────────────────────────────────────────────────────────────────
 @bot.command(name="like", aliases=["l", "send"])
-@commands.is_owner()
+@owner_only()
 @commands.cooldown(1, 15, commands.BucketType.user)
 async def like_command(ctx, uid: str, region: str):
     """[OWNER] Send likes manually. Usage: !like <uid> <region>"""
@@ -386,7 +415,7 @@ async def like_command(ctx, uid: str, region: str):
 
 # ── !info ─────────────────────────────────────────────────────────────────────
 @bot.command(name="info", aliases=["player", "p"])
-@commands.is_owner()
+@owner_only()
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def info_command(ctx, uid: str, region: str):
     """[OWNER] Get player info. Usage: !info <uid> <region>"""
@@ -418,7 +447,7 @@ async def info_command(ctx, uid: str, region: str):
 
 # ── !remain ───────────────────────────────────────────────────────────────────
 @bot.command(name="remain", aliases=["r", "quota", "q"])
-@commands.is_owner()
+@owner_only()
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def remain_command(ctx):
     """[OWNER] Check daily quota."""
@@ -441,7 +470,7 @@ async def remain_command(ctx):
 
 # ── !ping ─────────────────────────────────────────────────────────────────────
 @bot.command(name="ping", aliases=["status"])
-@commands.is_owner()
+@owner_only()
 async def ping_command(ctx):
     """[OWNER] Latency + API health."""
     ws_ms = round(bot.latency * 1000)
@@ -464,7 +493,7 @@ async def ping_command(ctx):
 
 # ── !stats ────────────────────────────────────────────────────────────────────
 @bot.command(name="stats")
-@commands.is_owner()
+@owner_only()
 async def stats_command(ctx):
     """[OWNER] Bot statistics."""
     subs = load_subs()
@@ -481,7 +510,7 @@ async def stats_command(ctx):
 
 # ── !plan add ─────────────────────────────────────────────────────────────────
 @bot.command(name="plan")
-@commands.is_owner()
+@owner_only()
 async def plan_command(ctx, action: str, *args):
     """[OWNER] Manage subscription plans. Subcommands: add, remove, list, check, extend, run"""
     action = action.lower()
@@ -700,7 +729,7 @@ async def plan_command(ctx, action: str, *args):
 
 # ── !adduid ───────────────────────────────────────────────────────────────────
 @bot.command(name="adduid")
-@commands.is_owner()
+@owner_only()
 async def adduid_command(ctx, uid: str, password: str, region: str = "BD"):
     region = region.upper()
     if not uid.isdigit():
@@ -727,7 +756,7 @@ async def adduid_command(ctx, uid: str, password: str, region: str = "BD"):
 
 # ── !removeuid ────────────────────────────────────────────────────────────────
 @bot.command(name="removeuid", aliases=["deluid", "rmuid"])
-@commands.is_owner()
+@owner_only()
 async def removeuid_command(ctx, uid: str, region: str = "BD"):
     region = region.upper()
     file_map = {"IND": "Uid_ind.json", "BD": "Uid_bd.json"}
@@ -748,7 +777,7 @@ async def removeuid_command(ctx, uid: str, region: str = "BD"):
 
 # ── !listuid ──────────────────────────────────────────────────────────────────
 @bot.command(name="listuid", aliases=["uids"])
-@commands.is_owner()
+@owner_only()
 async def listuid_command(ctx, region: str = "BD"):
     region = region.upper()
     file_map = {"IND": "Uid_ind.json", "BD": "Uid_bd.json"}
@@ -771,7 +800,7 @@ async def listuid_command(ctx, region: str = "BD"):
 
 # ── !refresh ──────────────────────────────────────────────────────────────────
 @bot.command(name="refresh", aliases=["rt"])
-@commands.is_owner()
+@owner_only()
 async def refresh_command(ctx):
     msg = await ctx.send(embed=info_embed("Refreshing Tokens...", "Running `refresh_tokens.py`..."))
     try:
@@ -789,7 +818,7 @@ async def refresh_command(ctx):
 
 # ── !setlimit ─────────────────────────────────────────────────────────────────
 @bot.command(name="setlimit")
-@commands.is_owner()
+@owner_only()
 async def setlimit_command(ctx, limit: int):
     try:
         status, data = await api_post("/setlimit", {"limit": limit, "key": API_KEY})
@@ -803,7 +832,7 @@ async def setlimit_command(ctx, limit: int):
 
 # ── !resetcount ───────────────────────────────────────────────────────────────
 @bot.command(name="resetcount", aliases=["resetdaily"])
-@commands.is_owner()
+@owner_only()
 async def resetcount_command(ctx):
     try:
         status, data = await api_post("/reset", {"key": API_KEY})
@@ -817,7 +846,7 @@ async def resetcount_command(ctx):
 
 # ── !help ─────────────────────────────────────────────────────────────────────
 @bot.command(name="help", aliases=["h", "commands"])
-@commands.is_owner()
+@owner_only()
 async def help_command(ctx):
     p = BOT_PREFIX
     embed = discord.Embed(
