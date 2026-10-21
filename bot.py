@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import discord
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -1192,8 +1193,29 @@ async def slash_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ── Flask auto-start ─────────────────────────────────────────────────────────
+def _start_flask():
+    """Boot the Flask API in a background daemon thread.
+    This means `python bot.py` is the only command needed — no start.py required.
+    """
+    try:
+        from app import app as flask_app
+        port = int(os.getenv("PORT", "5000"))
+        print(f"[Flask] Starting on http://127.0.0.1:{port} ...", flush=True)
+        flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"[Flask] FAILED to start: {e}", flush=True)
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise ValueError("DISCORD_TOKEN not set!")
+
+    # Start Flask in background thread so bot.py is self-contained
+    flask_thread = threading.Thread(target=_start_flask, daemon=True, name="FlaskThread")
+    flask_thread.start()
+    print("[Bot] Flask thread started. Waiting 2s for it to bind...", flush=True)
+    time.sleep(2)  # give Flask time to bind before bot tries /remain
+
     bot.run(DISCORD_TOKEN)
