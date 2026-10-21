@@ -6,14 +6,15 @@ import time
 PORT          = os.getenv("PORT", "5000")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 
-BOT_RESTART_DELAY = 15   # seconds to wait before restarting bot after crash
-MAX_BOT_RESTARTS  = 10   # give up after this many crashes (keeps Flask alive)
+# Backoff config: starts at MIN, doubles each crash, caps at MAX
+BACKOFF_MIN = 5    # seconds
+BACKOFF_MAX = 60   # seconds
+# If bot stays alive longer than this, reset backoff to min
+STABLE_THRESHOLD = 30  # seconds
 
 
-if __name__ == "__main__":
-
-    # ── Start Flask/Gunicorn as a background subprocess ───────────────────────
-    flask_proc = subprocess.Popen([
+def start_flask():
+    proc = subprocess.Popen([
         sys.executable, "-m", "gunicorn",
         "app:app",
         "--bind", f"0.0.0.0:{PORT}",
@@ -22,51 +23,73 @@ if __name__ == "__main__":
         "--timeout", "120",
         "--log-level", "info"
     ])
-    print(f"[start.py] Flask started (PID {flask_proc.pid}) on port {PORT}", flush=True)
+    print(f"[start.py] Flask started (PID {proc.pid}) on port {PORT}", flush=True)
+    return proc
 
-    # ── Short pause so Flask is ready before bot starts ───────────────────────
-    time.sleep(3)
 
-    # ── No token: keep Flask alive indefinitely ───────────────────────────────
+if __name__ == "__main__":
+
+    # ── Always start Flask first ───────────────────────────────────────────────
+    flask_proc = start_flask()
+    time.sleep(3)  # let Flask bind before bot tries to hit it
+
+    # ── No token: keep Flask alive, print clear instructions ──────────────────
     if not DISCORD_TOKEN:
-        print("[start.py] WARNING: DISCORD_TOKEN not set — bot will not start.", flush=True)
-        print("[start.py] Set DISCORD_TOKEN in Render > Environment tab, then redeploy.", flush=True)
+        print("[start.py] ERROR: DISCORD_TOKEN is not set!", flush=True)
+        print("[start.py] → Go to Render dashboard > Environment > add DISCORD_TOKEN", flush=True)
+        print("[start.py] → Get a new token from discord.com/developers/applications", flush=True)
+        print("[start.py] Flask is alive (health checks will pass). Bot NOT running.", flush=True)
         try:
             flask_proc.wait()
         except KeyboardInterrupt:
             flask_proc.terminate()
         sys.exit(0)
 
-    # ── Bot restart loop (Flask stays alive regardless) ───────────────────────
-    crash_count = 0
-    while crash_count < MAX_BOT_RESTARTS:
-        print(f"[start.py] Starting Discord bot (attempt {crash_count + 1})...", flush=True)
+    # ── Infinite bot restart loop ──────────────────────────────────────────────
+    attempt   = 0
+    backoff   = BACKOFF_MIN
+
+    while True:
+        attempt += 1
+        print(f"[start.py] ── Bot start attempt #{attempt} ──────────────────────", flush=True)
+
+        start_time = time.time()
         try:
             result = subprocess.run([sys.executable, "bot.py"])
             exit_code = result.returncode
         except KeyboardInterrupt:
-            print("[start.py] Interrupted — shutting down.", flush=True)
-            break
+            print("[start.py] KeyboardInterrupt — shutting everything down.", flush=True)
+            flask_proc.terminate()
+            sys.exit(0)
         except Exception as e:
-            print(f"[start.py] Bot launch error: {e}", flush=True)
+            print(f"[start.py] Failed to launch bot.py: {e}", flush=True)
             exit_code = 1
 
-        crash_count += 1
+        uptime = time.time() - start_time
 
-        # 401 Unauthorized = bad token, no point retrying
+        # ── Restart decision ──────────────────────────────────────────────────
         if exit_code == 0:
-            print("[start.py] Bot exited cleanly.", flush=True)
-            break
+            # Clean exit (Ctrl+C inside bot, or bot.close() called)
+            # Still restart — Render should always keep it alive
+            print(f"[start.py] Bot exited cleanly after {uptime:.0f}s. Restarting in {BACKOFF_MIN}s...", flush=True)
+            backoff = BACKOFF_MIN
+            time.sleep(BACKOFF_MIN)
+            continue
 
-        print(f"[start.py] Bot crashed (exit {exit_code}). Restart {crash_count}/{MAX_BOT_RESTARTS} in {BOT_RESTART_DELAY}s...", flush=True)
-        time.sleep(BOT_RESTART_DELAY)
+        # Crashed
+        if uptime >= STABLE_THRESHOLD:
+            # Ran long enough to be considered stable — reset backoff
+            backoff = BACKOFF_MIN
+            print(f"[start.py] Bot ran {uptime:.0f}s then crashed (exit {exit_code}). Restarting in {backoff}s...", flush=True)
+        else:
+            print(f"[start.py] Bot crashed after {uptime:.0f}s (exit {exit_code}). Restarting in {backoff}s...", flush=True)
 
-    if crash_count >= MAX_BOT_RESTARTS:
-        print(f"[start.py] Bot crashed {MAX_BOT_RESTARTS} times. Giving up — Flask still running.", flush=True)
+        # Make sure Flask is still alive; if it died, restart it too
+        if flask_proc.poll() is not None:
+            print("[start.py] Flask died — restarting Flask too...", flush=True)
+            flask_proc = start_flask()
 
-    # ── Keep Flask alive after bot gives up ───────────────────────────────────
-    print("[start.py] Keeping Flask alive (bot stopped).", flush=True)
-    try:
-        flask_proc.wait()
-    except KeyboardInterrupt:
-        flask_proc.terminate()
+        time.sleep(backoff)
+
+        # Double backoff for next crash (exponential), cap at max
+        backoff = min(backoff * 2, BACKOFF_MAX)
