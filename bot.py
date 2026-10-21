@@ -12,12 +12,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
-API_KEY        = os.getenv("API_KEY", "like")
-API_BASE_URL   = os.getenv("API_BASE_URL", "http://127.0.0.1:5000")
-BOT_PREFIX     = os.getenv("BOT_PREFIX", "!")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))   # optional: paste your log channel ID
-SUBS_FILE      = "subscriptions.json"
+DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
+API_KEY          = os.getenv("API_KEY", "like")
+API_BASE_URL     = os.getenv("API_BASE_URL", "http://127.0.0.1:5000")
+BOT_PREFIX       = os.getenv("BOT_PREFIX", "!")
+LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID",  "1562386401314607134"))  # log channel
+ALLOWED_CHANNEL  = int(os.getenv("ALLOWED_CHANNEL", "1562382385075585034"))  # commands-only channel
+OWNER_ID         = int(os.getenv("OWNER_ID",         "1390358560478728264"))  # your Discord user ID
+SUBS_FILE        = "subscriptions.json"
 
 VALID_REGIONS = {"IND", "BD", "BR", "US", "SAC", "NA", "SG", "TH", "ID", "TW", "VN", "PK"}
 REGION_FLAGS  = {
@@ -111,6 +113,21 @@ def info_embed(title, desc=""):
     return discord.Embed(title=f"ℹ️ {title}", description=desc, color=discord.Color.blurple())
 
 
+# ── Global channel restriction ────────────────────────────────────────────────
+async def channel_check(ctx: commands.Context) -> bool:
+    """Only allow commands in ALLOWED_CHANNEL (or DMs from owner)."""
+    # Always allow in DMs (for owner)
+    if ctx.guild is None:
+        return True
+    if ctx.channel.id == ALLOWED_CHANNEL:
+        return True
+    # Silently ignore — delete the message so the channel stays clean
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    return False
+
 async def log(msg_or_embed):
     if LOG_CHANNEL_ID:
         ch = bot.get_channel(LOG_CHANNEL_ID)
@@ -146,17 +163,23 @@ async def api_post(path: str, payload: dict, timeout: int = 15):
 async def on_ready():
     app_info = await bot.application_info()
     bot.owner_id = app_info.owner.id
+
+    # Register global channel check (only respond in ALLOWED_CHANNEL)
+    bot.add_check(channel_check)
+
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
         name=f"{BOT_PREFIX}help | FF Like Bot"
     ))
     print(f"[OK] Bot: {bot.user}  Owner: {app_info.owner}  Prefix: {BOT_PREFIX}")
+    print(f"[OK] Commands restricted to channel ID: {ALLOWED_CHANNEL}")
 
     # Start scheduled tasks
     if not daily_reset_task.is_running():
         daily_reset_task.start()
     if not daily_autolike_task.is_running():
         daily_autolike_task.start()
+
 
 
 @bot.event
