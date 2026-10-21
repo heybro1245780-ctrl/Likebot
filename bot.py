@@ -15,7 +15,7 @@ load_dotenv()
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 API_KEY          = os.getenv("API_KEY", "like")
 API_BASE_URL     = os.getenv("API_BASE_URL", "http://127.0.0.1:5000")
-BOT_PREFIX       = os.getenv("BOT_PREFIX", "!")
+BOT_PREFIX       = os.getenv("BOT_PREFIX", "$")
 LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID",  "1562386401314607134"))  # log channel
 ALLOWED_CHANNEL  = int(os.getenv("ALLOWED_CHANNEL", "1562382385075585034"))  # commands-only channel
 OWNER_ID         = int(os.getenv("OWNER_ID",         "1390358560478728264"))  # your Discord user ID
@@ -49,7 +49,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
+# Set owner_id at creation so commands.is_owner() works before on_ready fires
+bot = commands.Bot(
+    command_prefix=BOT_PREFIX,
+    intents=intents,
+    help_command=None,
+    owner_id=OWNER_ID,
+)
 
 
 # ── Subscription DB helpers ───────────────────────────────────────────────────
@@ -161,8 +167,15 @@ async def api_post(path: str, payload: dict, timeout: int = 15):
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    app_info = await bot.application_info()
-    bot.owner_id = app_info.owner.id
+    try:
+        app_info = await bot.application_info()
+        # Always prefer the API result, but OWNER_ID is already set at construction
+        if app_info.owner:
+            bot.owner_id = app_info.owner.id
+    except Exception:
+        pass  # owner_id already set to OWNER_ID at bot creation
+
+    print(f"[OK] Bot: {bot.user}  Owner ID: {bot.owner_id}  Prefix: {BOT_PREFIX}")
 
     # Register global channel check (only respond in ALLOWED_CHANNEL)
     bot.add_check(channel_check)
@@ -171,7 +184,6 @@ async def on_ready():
         type=discord.ActivityType.watching,
         name=f"{BOT_PREFIX}help | FF Like Bot"
     ))
-    print(f"[OK] Bot: {bot.user}  Owner: {app_info.owner}  Prefix: {BOT_PREFIX}")
     print(f"[OK] Commands restricted to channel ID: {ALLOWED_CHANNEL}")
 
     # Start scheduled tasks
