@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -13,6 +13,18 @@ from google.protobuf.message import DecodeError
 from collections import OrderedDict
 
 app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "Free Fire Like API",
+        "endpoints": {
+            "like": "/like?uid=UID&region=REGION&key=API_KEY",
+            "remain": "/remain"
+        },
+        "regions": ["IND", "BD", "BR", "US", "SG", "TH", "ID", "TW", "VN", "PK", "SAC", "NA"]
+    })
 
 # ✅MEHEDI
 VALID_API_KEYS = {
@@ -171,8 +183,8 @@ def handle_requests():
             ("error", "Invalid or missing API key"),
             ("status", 3)
         ])
-        return app.response_class(
-            response=json.dumps(result, separators=(',', ':')),
+        return Response(
+            json.dumps(result, separators=(',', ':')),
             status=401,
             mimetype='application/json'
         )
@@ -234,8 +246,8 @@ def handle_requests():
                 ("remaining", remaining)
             ])
 
-            return app.response_class(
-                response=json.dumps(result, separators=(',', ':')),
+            return Response(
+                json.dumps(result, separators=(',', ':')),
                 status=200,
                 mimetype='application/json'
             )
@@ -260,6 +272,31 @@ def remain_info():
         "reset_info": "4:00 AM IST"
     }
     return jsonify(data)
+
+
+# 🆕 /setlimit — update daily limit (called by bot owner command)
+@app.route('/setlimit', methods=['POST'])
+def set_limit():
+    global daily_limit
+    api_key = request.json.get('key') if request.json else None
+    if api_key not in VALID_API_KEYS:
+        return jsonify({"error": "Unauthorized"}), 401
+    new_limit = request.json.get('limit')
+    if not isinstance(new_limit, int) or new_limit < 0:
+        return jsonify({"error": "Invalid limit value"}), 400
+    daily_limit = new_limit
+    return jsonify({"success": True, "daily_limit": daily_limit})
+
+
+# 🆕 /reset — reset daily used count (called by scheduler at 4AM IST)
+@app.route('/reset', methods=['POST'])
+def reset_count():
+    global used_count
+    api_key = request.json.get('key') if request.json else None
+    if api_key not in VALID_API_KEYS:
+        return jsonify({"error": "Unauthorized"}), 401
+    used_count = 0
+    return jsonify({"success": True, "message": "Daily count reset"})
 
 
 if __name__ == '__main__':
