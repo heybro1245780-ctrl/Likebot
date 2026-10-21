@@ -1,14 +1,8 @@
 from flask import Flask, request, jsonify, Response
 import requests
 import json
-import random
 import os
 from collections import OrderedDict
-
-# ── Protobuf imports ──────────────────────────────────────────────────────────
-from like_pb2 import like as LikeMessage
-from uid_generator_pb2 import uid_generator as UIDGen
-from visit_count_pb2 import Info as VisitInfo
 
 app = Flask(__name__)
 
@@ -20,137 +14,113 @@ used_count  = 0
 
 VALID_REGIONS = {"IND", "BD"}
 
-# ── Region → Garena like endpoint ─────────────────────────────────────────────
-REGION_LIKE_URL = {
-    "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
-    "BD":  "https://clientbd.freefiremobile.com/GetPlayerPersonalShow",
-}
+# ── Fallback Like API chain ───────────────────────────────────────────────────
+# Tried in order; first success wins.  Add/remove/reorder as APIs come and go.
+LIKE_APIS = [
+    {
+        "name": "mujahid",
+        "url":  "https://like.mujahid.xyz/like",
+        "params": lambda uid, region: {"uid": uid, "region": region, "key": "ABHINANDAN"},
+        "method": "GET",
+    },
+    {
+        "name": "likeservice1",
+        "url":  "https://likeservice.vercel.app/like",
+        "params": lambda uid, region: {"uid": uid, "region": region},
+        "method": "GET",
+    },
+    {
+        "name": "fflike_api",
+        "url":  "https://fflike-api.vercel.app/like",
+        "params": lambda uid, region: {"uid": uid, "region": region},
+        "method": "GET",
+    },
+    {
+        "name": "garenalike",
+        "url":  "https://garena-like.vercel.app/api/like",
+        "params": lambda uid, region: {"uid": uid, "region": region},
+        "method": "GET",
+    },
+    {
+        "name": "fflikeapi_xyz",
+        "url":  "https://fflikeapi.xyz/like",
+        "params": lambda uid, region: {"uid": uid, "region": region},
+        "method": "GET",
+    },
+]
 
-# Token files per region
-TOKEN_FILES = {
-    "IND": "token_ind.json",
-    "BD":  "token_bd.json",
-}
 
 
-# ── Token loader ──────────────────────────────────────────────────────────────
-def load_tokens(region: str) -> list:
-    path = TOKEN_FILES.get(region, "")
-    if not path or not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        tokens = []
-        for entry in data:
-            if isinstance(entry, dict):
-                t = entry.get("token") or entry.get("jwt_token") or entry.get("access_token")
-            elif isinstance(entry, str):
-                t = entry
+def _get(data: dict, *keys, default=0):
+    for k in keys:
+        if k in data:
+            return data[k]
+    return default
+
+
+def normalize(data: dict, region: str, uid: str) -> dict:
+    """Map any external API's response shape to our standard fields."""
+    return {
+        "LikesGivenByAPI":   _get(data, "LikesGivenByAPI",   "likes_given",  "liked",        default=0),
+        "LikesafterCommand": _get(data, "LikesafterCommand",  "likes_after",  "after_likes",  default=0),
+        "LikesbeforeCommand":_get(data, "LikesbeforeCommand", "likes_before", "before_likes", default=0),
+        "PlayerNickname":    _get(data, "PlayerNickname",     "nickname",     "name",         default="?"),
+        "Level":             _get(data, "Level",              "level",                        default="?"),
+        "Region":            _get(data, "Region",             "region",                       default=region),
+        "UID":               _get(data, "UID",                "uid",                          default=uid),
+        "status":            _get(data, "status",                                             default=2),
+    }
+
+
+# ── Multi-API fallback like sender ────────────────────────────────────────────
+def send_likes(uid: str, region: str) -> dict:
+    """
+    Try each API in LIKE_APIS in order.
+    Returns a normalized dict on first success, or {"status": 0, "error": ...} if all fail.
+    Tracks which APIs failed for the error message.
+    """
+    errors = []
+
+    for api in LIKE_APIS:
+        try:
+            params = api["params"](uid, region)
+            if api["method"] == "GET":
+                resp = requests.get(api["url"], params=params, timeout=25)
             else:
+                resp = requests.post(api["url"], json=params, timeout=25)
+
+            # Skip clearly failed responses
+            if resp.status_code in (403, 401, 404):
+                errors.append(f"{api['name']}:HTTP{resp.status_code}")
                 continue
-            if t:
-                tokens.append(t)
-        return tokens
-    except Exception:
-        return []
 
+            if resp.status_code != 200:
+                errors.append(f"{api['name']}:HTTP{resp.status_code}")
+                continue
 
-def pick_token(region: str):
-    tokens = load_tokens(region)
-    return random.choice(tokens) if tokens else None
+            try:
+                data = resp.json()
+            except Exception:
+                errors.append(f"{api['name']}:bad_json")
+                continue
 
+            # If the API itself returned an error status, keep trying
+            if isinstance(data, dict) and data.get("status") == 0:
+                errors.append(f"{api['name']}:status0")
+                continue
 
-# ── Build protobuf bodies ─────────────────────────────────────────────────────
-def build_like_body(uid: int, region: str) -> bytes:
-    msg = LikeMessage()
-    msg.uid    = uid
-    msg.region = region
-    return msg.SerializeToString()
+            # Success — normalize and return
+            result = normalize(data, region, uid)
+            print(f"[LIKE] {api['name']} OK for uid={uid} region={region}", flush=True)
+            return result
 
+        except requests.exceptions.Timeout:
+            errors.append(f"{api['name']}:timeout")
+        except requests.exceptions.RequestException as e:
+            errors.append(f"{api['name']}:{str(e)[:40]}")
 
-def build_uid_body(uid: int) -> bytes:
-    msg = UIDGen()
-    msg.saturn_ = uid
-    msg.garena  = 0
-    return msg.SerializeToString()
-
-
-# ── Common Garena headers ─────────────────────────────────────────────────────
-def garena_headers(token: str) -> dict:
-    return {
-        "Authorization":   f"Bearer {token}",
-        "Content-Type":    "application/x-www-form-urlencoded",
-        "User-Agent":      "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        "Connection":      "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "X-Unity-Version": "2018.4.11f1",
-        "ReleaseVersion":  "OB55",
-    }
-
-
-# ── Fetch current likes for a player ─────────────────────────────────────────
-def get_player_info(uid: int, region: str, token: str = None):
-    """Returns (nickname, level, p_region, likes) or raises on failure."""
-    if token is None:
-        token = pick_token(region)
-    if not token:
-        raise RuntimeError(f"No tokens available for region {region}")
-    url  = REGION_LIKE_URL.get(region)
-    body = build_uid_body(uid)
-    resp = requests.post(url, data=body, headers=garena_headers(token), timeout=20)
-    resp.raise_for_status()
-    info = VisitInfo()
-    info.ParseFromString(resp.content)
-    acc = info.AccountInfo
-    return acc.PlayerNickname or str(uid), acc.Levels, acc.PlayerRegion or region, acc.Likes
-
-
-# ── Send likes to a UID ───────────────────────────────────────────────────────
-def send_likes(uid: int, region: str) -> dict:
-    token = pick_token(region)
-    if not token:
-        return {"error": f"No tokens available for region {region}", "status": 0}
-
-    url  = REGION_LIKE_URL.get(region)
-
-    # Fetch info BEFORE sending likes
-    try:
-        nickname, level, p_region, before_likes = get_player_info(uid, region, token)
-    except Exception as e:
-        return {"error": f"Player info fetch failed: {str(e)}", "status": 0}
-
-    # Send like
-    like_body = build_like_body(uid, region)
-    try:
-        resp = requests.post(url, data=like_body, headers=garena_headers(token), timeout=30)
-    except requests.exceptions.Timeout:
-        return {"error": "Garena API timed out", "status": 0}
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Network error: {str(e)}", "status": 0}
-
-    if resp.status_code not in (200, 400):
-        return {"error": f"Garena returned HTTP {resp.status_code}", "status": 0}
-
-    # Fetch info AFTER to calculate delta
-    try:
-        _, _, _, after_likes = get_player_info(uid, region, token)
-    except Exception:
-        after_likes = before_likes   # fallback — assume maxed
-
-    given  = max(after_likes - before_likes, 0)
-    status = 1 if given > 0 else 2   # 1=sent, 2=maxed/already full
-
-    return {
-        "LikesGivenByAPI":   given,
-        "LikesafterCommand": after_likes,
-        "LikesbeforeCommand":before_likes,
-        "PlayerNickname":    nickname,
-        "Level":             level,
-        "Region":            p_region,
-        "UID":               uid,
-        "status":            status,
-    }
+    # All APIs failed
+    return {"status": 0, "error": f"All like APIs failed: {', '.join(errors)}"}
 
 
 # ── Home ──────────────────────────────────────────────────────────────────────
@@ -188,12 +158,12 @@ def handle_requests():
     if region not in VALID_REGIONS:
         return jsonify({"error": f"Region '{region}' not supported. Use IND or BD."}), 400
 
-    data = send_likes(int(uid_str), region)
+    data = send_likes(uid_str, region)
 
     if data.get("status") == 0:
-        return jsonify({"error": data.get("error", "Like failed"), "status": 0}), 502
+        return jsonify({"error": data.get("error", "All like APIs failed"), "status": 0}), 502
 
-    status    = data.get("status", 2)
+    status = data.get("status", 2)
     if status == 1:
         used_count += 1
     remaining = max(daily_limit - used_count, 0)
@@ -216,6 +186,7 @@ def handle_requests():
         json.dumps(result, separators=(',', ':')),
         status=200, mimetype='application/json'
     )
+
 
 
 # ── /remain ───────────────────────────────────────────────────────────────────
