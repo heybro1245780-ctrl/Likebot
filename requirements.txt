@@ -1,4 +1,4 @@
-﻿Flask[async]
+Flask
 requests
 aiohttp
 googleapis-common-protos
@@ -6,5 +6,5 @@ pycryptodome
 protobuf
 Werkzeug
 gunicorn
-discord.py>=2.3.0
+discord.py
 python-dotenv

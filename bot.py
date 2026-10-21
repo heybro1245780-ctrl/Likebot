@@ -1,10 +1,13 @@
-﻿import os
+import os
 import discord
 import aiohttp
 from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env file automatically
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-DISCORD_TOKEN = os.getenv("MTU2MjM3MTQwNTEwNDgxMjA0Mg.GoPzjC.jxGvKafOispWHoGHhjvDkrqqQkST5H7OEG0g9w")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY       = os.getenv("API_KEY", "like")
 API_BASE_URL  = os.getenv("API_BASE_URL", "http://127.0.0.1:5000")
 BOT_PREFIX    = os.getenv("BOT_PREFIX", "!")

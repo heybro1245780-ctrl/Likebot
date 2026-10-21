@@ -1,0 +1,16 @@
+﻿services:
+  - type: web
+    name: ff-like-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python start.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: API_KEY
+        value: like
+      - key: BOT_PREFIX
+        value: '!'
+      - key: PYTHON_VERSION
+        value: 3.11.0
