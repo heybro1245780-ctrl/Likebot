@@ -23,7 +23,7 @@ def home():
             "like": "/like?uid=UID&region=REGION&key=API_KEY",
             "remain": "/remain"
         },
-        "regions": ["IND", "BD", "BR", "US", "SG", "TH", "ID", "TW", "VN", "PK", "SAC", "NA"]
+        "regions": ["IND", "BD"]
     })
 
 # ✅MEHEDI
@@ -193,6 +193,10 @@ def handle_requests():
     region = request.args.get("region", "").upper()
     if not uid or not region:
         return {"error": "UID and region are required"}, 400
+
+    if region not in {"IND", "BD"}:
+        return {"error": f"Region '{region}' not supported. Use IND or BD."}, 400
+
 
     try:
         def process_request():

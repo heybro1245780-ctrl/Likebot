@@ -221,6 +221,22 @@ async def on_ready():
     ))
     print(f"[OK] Commands restricted to channel ID: {ALLOWED_CHANNEL}", flush=True)
 
+    # ── Wait for Flask/API to be ready ───────────────────────────────────────
+    print(f"[start] Waiting for Flask API at {API_BASE_URL} ...", flush=True)
+    for attempt in range(15):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{API_BASE_URL}/remain",
+                                 timeout=aiohttp.ClientTimeout(total=3)) as r:
+                    if r.status < 500:
+                        print(f"[OK] Flask API ready (attempt {attempt+1})", flush=True)
+                        break
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    else:
+        print("[WARN] Flask API not reachable — commands will fail until it starts", flush=True)
+
     # Start scheduled tasks
     if not daily_reset_task.is_running():
         daily_reset_task.start()
