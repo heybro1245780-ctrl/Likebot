@@ -1,0 +1,10 @@
+﻿Flask[async]
+requests
+aiohttp
+googleapis-common-protos
+pycryptodome
+protobuf
+Werkzeug
+gunicorn
+discord.py>=2.3.0
+python-dotenv
