@@ -14,15 +14,12 @@ STABLE_THRESHOLD = 30  # seconds
 
 
 def start_flask():
-    proc = subprocess.Popen([
-        sys.executable, "-m", "gunicorn",
-        "app:app",
-        "--bind", f"0.0.0.0:{PORT}",
-        "--workers", "1",
-        "--threads", "4",
-        "--timeout", "120",
-        "--log-level", "info"
-    ])
+    env = os.environ.copy()
+    env["FLASK_ENV"] = "production"
+    proc = subprocess.Popen(
+        [sys.executable, "app.py"],
+        env=env
+    )
     print(f"[start.py] Flask started (PID {proc.pid}) on port {PORT}", flush=True)
     return proc
 

@@ -934,23 +934,25 @@ async def _slash_guard(interaction: discord.Interaction) -> bool:
 
 
 @tree.command(name="like", description="Send likes to a Free Fire player")
-@app_commands.describe(uid="Player UID (numbers only)", region="Region code e.g. IND, BD, BR")
-async def slash_like(interaction: discord.Interaction, uid: str, region: str):
+@app_commands.describe(uid="Player UID (numbers only)", region="Select your region")
+@app_commands.choices(region=[
+    app_commands.Choice(name="🇮🇳 IND — India", value="IND"),
+    app_commands.Choice(name="🇧🇩 BD — Bangladesh", value="BD"),
+])
+async def slash_like(interaction: discord.Interaction, uid: str, region: app_commands.Choice[str]):
     if not await _slash_guard(interaction): return
-    region = region.upper()
+    region_val = region.value  # already validated by Discord choices
     if not uid.isdigit():
         return await interaction.response.send_message(embed=err_embed("Invalid UID", "Numbers only."), ephemeral=True)
-    if region not in VALID_REGIONS:
-        return await interaction.response.send_message(embed=err_embed("Invalid Region", "Valid: `" + "` `".join(sorted(VALID_REGIONS)) + "`"), ephemeral=True)
-    await interaction.response.send_message(embed=discord.Embed(title="⏳ Sending Likes...", description=f"UID: `{uid}` | Region: `{region}`", color=discord.Color.blurple()))
+    await interaction.response.send_message(embed=discord.Embed(title="⏳ Sending Likes...", description=f"UID: `{uid}` | Region: `{region_val}`", color=discord.Color.blurple()))
     try:
-        status, data = await api_get("/like", {"uid": uid, "region": region, "key": API_KEY})
+        status, data = await api_get("/like", {"uid": uid, "region": region_val, "key": API_KEY})
         if status == 401:
             embed = err_embed("API Key Error", "Invalid API key.")
         elif status == 200:
             s = data.get("status", 2); likes_given = data.get("LikesGivenByAPI", 0)
             nickname = data.get("PlayerNickname", "?"); level = data.get("Level", "?")
-            p_region = data.get("Region", region); after = data.get("LikesafterCommand", 0)
+            p_region = data.get("Region", region_val); after = data.get("LikesafterCommand", 0)
             before = data.get("LikesbeforeCommand", 0); remaining = data.get("remaining", 0)
             daily_limit = data.get("daily_limit", 300); used = data.get("used", 0)
             if s == 1:
@@ -975,25 +977,29 @@ async def slash_like(interaction: discord.Interaction, uid: str, region: str):
 
 
 @tree.command(name="info", description="Get Free Fire player info")
-@app_commands.describe(uid="Player UID", region="Region code e.g. IND, BD")
-async def slash_info(interaction: discord.Interaction, uid: str, region: str):
+@app_commands.describe(uid="Player UID", region="Select your region")
+@app_commands.choices(region=[
+    app_commands.Choice(name="🇮🇳 IND — India", value="IND"),
+    app_commands.Choice(name="🇧🇩 BD — Bangladesh", value="BD"),
+])
+async def slash_info(interaction: discord.Interaction, uid: str, region: app_commands.Choice[str]):
     if not await _slash_guard(interaction): return
-    region = region.upper()
+    region_val = region.value
     if not uid.isdigit():
         return await interaction.response.send_message(embed=err_embed("Invalid UID", "Numbers only."), ephemeral=True)
-    await interaction.response.send_message(embed=info_embed("Fetching...", f"UID `{uid}` in `{region}`"))
+    await interaction.response.send_message(embed=info_embed("Fetching...", f"UID `{uid}` in `{region_val}`"))
     try:
-        status, data = await api_get("/like", {"uid": uid, "region": region, "key": API_KEY})
+        status, data = await api_get("/like", {"uid": uid, "region": region_val, "key": API_KEY})
         if status == 200:
             nickname = data.get("PlayerNickname", "?"); level = data.get("Level", "?")
-            p_region = data.get("Region", region); likes = data.get("LikesafterCommand", 0)
+            p_region = data.get("Region", region_val); likes = data.get("LikesafterCommand", 0)
             embed = discord.Embed(title=f"🎮 {nickname}", color=discord.Color.blurple())
             embed.add_field(name="🆔 UID", value=f"`{uid}`", inline=True)
             embed.add_field(name="🏅 Level", value=f"`{level}`", inline=True)
             embed.add_field(name="🌍 Region", value=f"`{REGION_FLAGS.get(str(p_region), str(p_region))} {p_region}`", inline=True)
             embed.add_field(name="❤️ Likes", value=f"`{likes}`", inline=True)
         else:
-            embed = err_embed("Not Found", f"UID `{uid}` in `{region}` not found.")
+            embed = err_embed("Not Found", f"UID `{uid}` in `{region_val}` not found.")
     except Exception as e:
         embed = err_embed("Error", str(e)[:300])
     await interaction.edit_original_response(embed=embed)

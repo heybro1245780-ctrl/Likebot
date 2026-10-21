@@ -304,4 +304,6 @@ def reset_count():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    import os as _os
+    _port = int(_os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=_port, debug=False, use_reloader=False)
