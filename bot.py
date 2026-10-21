@@ -15,8 +15,8 @@ load_dotenv(override=False)  # never let .env override real env vars (e.g. Rende
 # ── Config ────────────────────────────────────────────────────────────────────-
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 API_KEY          = os.getenv("API_KEY", "like")
-_PORT            = os.getenv("PORT", "5000")                                  # matches gunicorn bind port
-API_BASE_URL     = os.getenv("API_BASE_URL", f"http://127.0.0.1:{_PORT}")    # auto-matches Flask port
+_PORT            = os.getenv("PORT", "5000")           # Render injects the real port here
+API_BASE_URL     = f"http://127.0.0.1:{_PORT}"         # always built from PORT — never hardcoded
 BOT_PREFIX       = os.getenv("BOT_PREFIX", "$")
 LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID",  "1562386401314607134"))  # log channel
 ALLOWED_CHANNEL  = int(os.getenv("ALLOWED_CHANNEL", "1562382385075585034"))  # commands-only channel
